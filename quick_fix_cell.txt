@@ -1,0 +1,182 @@
+# ========================================
+# QUICK FIX: Aggressive Cosine Annealing Restart
+# ========================================
+# Copy this entire cell into your notebook and run it
+
+import torch
+import torch.nn as nn
+from torchvision.models.detection import retinanet_resnet50_fpn, RetinaNet_ResNet50_FPN_Weights
+import numpy as np
+
+# Re-initialize model from scratch
+print("Initializing new RetinaNet with aggressive training config...")
+model_retina_v3 = retinanet_resnet50_fpn(weights=RetinaNet_ResNet50_FPN_Weights.DEFAULT)
+
+cls_head = model_retina_v3.head.classification_head
+in_channels = cls_head.cls_logits.in_channels
+num_anchors = cls_head.num_anchors
+new_num_classes = num_classes + 1  # 15 (14 classes + background)
+
+cls_head.cls_logits = nn.Conv2d(
+    in_channels,
+    num_anchors * new_num_classes,
+    kernel_size=3,
+    stride=1,
+    padding=1
+)
+cls_head.num_classes = new_num_classes
+model_retina_v3.to(device)
+
+# AGGRESSIVE optimizer with 2.5x higher LR
+optimizer_v3 = torch.optim.AdamW(
+    model_retina_v3.parameters(),
+    lr=5e-4,  # Higher than previous 2e-4
+    weight_decay=1e-4
+)
+
+num_epochs_v3 = 50
+
+# Cosine Annealing (smoother than MultiStepLR)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer_v3,
+    T_max=num_epochs_v3 - 5,  # Exclude warmup epochs
+    eta_min=1e-6
+)
+
+# Warmup for first 5 epochs
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+    optimizer_v3,
+    start_factor=0.1,
+    total_iters=5
+)
+
+# Combine warmup + cosine
+lr_scheduler_v3 = torch.optim.lr_scheduler.SequentialLR(
+    optimizer_v3,
+    schedulers=[warmup_scheduler, cosine_scheduler],
+    milestones=[5]
+)
+
+train_losses_v3 = []
+val_losses_v3 = []
+
+print("=" * 70)
+print("AGGRESSIVE COSINE ANNEALING TRAINING")
+print("=" * 70)
+print(f"Initial LR: {optimizer_v3.param_groups[0]['lr']:.2e}")
+print(f"Training for {num_epochs_v3} epochs")
+print("Expected behavior:")
+print("  Epochs 1-5:   Loss drops from ~2000 to ~600-800")
+print("  Epochs 5-15:  Loss drops to ~200-400")
+print("  Epochs 15-30: Loss drops to ~80-150")
+print("  Epochs 30+:   Loss stabilizes around 50-100")
+print("=" * 70)
+
+for epoch in range(num_epochs_v3):
+    # Train
+    model_retina_v3.train()
+    running_train_loss = 0.0
+
+    for images, targets in train_loader_v2:
+        images = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        loss_dict = model_retina_v3(images, targets)
+        losses = sum(loss_dict.values())
+
+        optimizer_v3.zero_grad()
+        losses.backward()
+
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model_retina_v3.parameters(), max_norm=1.0)
+
+        optimizer_v3.step()
+        running_train_loss += losses.item()
+
+    avg_train_loss = running_train_loss / max(1, len(train_loader_v2))
+    train_losses_v3.append(avg_train_loss)
+
+    # Validation
+    running_val_loss = 0.0
+    with torch.no_grad():
+        model_retina_v3.train()
+        for images, targets in val_loader_v2:
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            loss_dict = model_retina_v3(images, targets)
+            losses = sum(loss_dict.values())
+            running_val_loss += losses.item()
+
+    avg_val_loss = running_val_loss / max(1, len(val_loader_v2))
+    val_losses_v3.append(avg_val_loss)
+
+    lr_scheduler_v3.step()
+    current_lr = optimizer_v3.param_groups[0]['lr']
+
+    # Print every 2 epochs early, every 5 epochs later
+    if epoch < 15 or (epoch + 1) % 5 == 0:
+        print(f"Epoch [{epoch+1}/{num_epochs_v3}]  "
+              f"Train: {avg_train_loss:.4f}  "
+              f"Val: {avg_val_loss:.4f}  "
+              f"LR: {current_lr:.6f}")
+
+        # Early warning system
+        if epoch == 4 and avg_val_loss > 1200:
+            print("   ⚠️  WARNING: Loss still very high after warmup")
+        elif epoch == 14 and avg_val_loss > 500:
+            print("   ⚠️  WARNING: Loss not decreasing fast enough")
+        elif epoch == 14 and avg_val_loss < 300:
+            print("   ✓ Training looks healthy!")
+
+print("\n" + "=" * 70)
+print("TRAINING COMPLETE")
+print("=" * 70)
+print(f"Final train loss: {train_losses_v3[-1]:.4f}")
+print(f"Final val loss:   {val_losses_v3[-1]:.4f}")
+print(f"Best val loss:    {min(val_losses_v3):.4f} at epoch {np.argmin(val_losses_v3) + 1}")
+
+# Plot losses
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(14, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(train_losses_v3, label='Train Loss v3', linewidth=2)
+plt.plot(val_losses_v3, label='Val Loss v3', linewidth=2)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Progress (v3 - Aggressive Cosine)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.plot(train_losses_v3, label='Train Loss v3', linewidth=2)
+plt.plot(val_losses_v3, label='Val Loss v3', linewidth=2)
+plt.xlabel('Epoch')
+plt.ylabel('Loss (log scale)')
+plt.yscale('log')
+plt.title('Training Progress (Log Scale)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Save the model
+torch.save(model_retina_v3.state_dict(), 'model_retina_v3_aggressive.pth')
+print("\nModel saved as 'model_retina_v3_aggressive.pth'")
+
+# Verdict
+print("\n" + "=" * 70)
+print("VERDICT")
+print("=" * 70)
+if min(val_losses_v3) < 200:
+    print("✓ SUCCESS! Your model is learning properly now.")
+    print("  You can use this model for submission generation.")
+elif min(val_losses_v3) < 500:
+    print("⚠️  PARTIAL SUCCESS - Model is learning but not optimal.")
+    print("  Consider trying Faster RCNN or adjusting augmentation.")
+else:
+    print("❌ FAILED - Loss still too high.")
+    print("  Recommended: Try Faster RCNN (Alternative 2 below)")
