@@ -1,0 +1,171 @@
+# ========================================
+# ADVANCED: Generate Multiple Submissions with Different Thresholds
+# Copy this entire cell into your notebook
+# ========================================
+
+import torch
+import torch.nn as nn
+from torchvision.models.detection import retinanet_resnet50_fpn, RetinaNet_ResNet50_FPN_Weights
+from torchvision.ops import nms
+import cv2
+import numpy as np
+from pathlib import Path
+import pandas as pd
+import subprocess
+
+# ========================================
+# CONFIGURATION
+# ========================================
+
+MODEL_PATH = "model_retina_v2.pth"  # Your saved model
+IMG_SIZE = 416
+NMS_THRESH = 0.5
+
+# Try multiple score thresholds automatically
+THRESHOLDS_TO_TRY = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+print("=" * 70)
+print("MULTI-THRESHOLD SUBMISSION GENERATOR")
+print("=" * 70)
+print(f"Model: {MODEL_PATH}")
+print(f"Thresholds to try: {THRESHOLDS_TO_TRY}")
+print(f"This will generate {len(THRESHOLDS_TO_TRY)} submissions")
+print("=" * 70)
+
+# ========================================
+# Load Model (once)
+# ========================================
+
+print("\nLoading model...")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = retinanet_resnet50_fpn(weights=RetinaNet_ResNet50_FPN_Weights.DEFAULT)
+
+cls_head = model.head.classification_head
+in_channels = cls_head.cls_logits.in_channels
+num_anchors = cls_head.num_anchors
+new_num_classes = num_classes + 1
+
+cls_head.cls_logits = nn.Conv2d(in_channels, num_anchors * new_num_classes, kernel_size=3, stride=1, padding=1)
+cls_head.num_classes = new_num_classes
+
+state_dict = torch.load(MODEL_PATH, map_location=device)
+model.load_state_dict(state_dict)
+model.to(device)
+model.eval()
+
+print("✓ Model loaded!")
+
+# ========================================
+# Generate Predictions Once (all boxes, no threshold)
+# ========================================
+
+print("\nGenerating all predictions...")
+test_images = sorted(TEST_IMAGES.glob("*.jpg"))
+
+# Store ALL predictions (we'll filter by threshold later)
+all_predictions = []
+
+with torch.no_grad():
+    for idx, img_path in enumerate(test_images):
+        if (idx + 1) % 100 == 0:
+            print(f"  {idx + 1}/{len(test_images)}...")
+
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+        img_tensor = torch.from_numpy(img_resized.astype(np.float32) / 255.0).permute(2, 0, 1)
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+
+        outputs = model(img_tensor)
+
+        boxes = outputs[0]['boxes'].cpu().numpy()
+        scores = outputs[0]['scores'].cpu().numpy()
+        labels = outputs[0]['labels'].cpu().numpy()
+
+        # Apply NMS per class (but keep all scores)
+        for label in np.unique(labels):
+            label_mask = labels == label
+            label_boxes = boxes[label_mask]
+            label_scores = scores[label_mask]
+
+            keep_nms = nms(torch.from_numpy(label_boxes), torch.from_numpy(label_scores), NMS_THRESH)
+            keep_nms = keep_nms.cpu().numpy()
+
+            for i in keep_nms:
+                # Normalize coordinates
+                x1 = np.clip(label_boxes[i, 0] / IMG_SIZE, 0, 1)
+                y1 = np.clip(label_boxes[i, 1] / IMG_SIZE, 0, 1)
+                x2 = np.clip(label_boxes[i, 2] / IMG_SIZE, 0, 1)
+                y2 = np.clip(label_boxes[i, 3] / IMG_SIZE, 0, 1)
+
+                all_predictions.append({
+                    'image_id': img_path.stem,
+                    'class_id': int(label) - 1,  # Convert back to [0, num_classes-1]
+                    'confidence': float(label_scores[i]),
+                    'xmin': float(x1),
+                    'ymin': float(y1),
+                    'xmax': float(x2),
+                    'ymax': float(y2)
+                })
+
+print(f"✓ Generated {len(all_predictions)} total predictions (before threshold filtering)")
+
+# ========================================
+# Create Submissions for Each Threshold
+# ========================================
+
+all_predictions_df = pd.DataFrame(all_predictions)
+
+for thresh in THRESHOLDS_TO_TRY:
+    print("\n" + "=" * 70)
+    print(f"THRESHOLD: {thresh}")
+    print("=" * 70)
+
+    # Filter by threshold
+    filtered_df = all_predictions_df[all_predictions_df['confidence'] >= thresh].copy()
+
+    output_csv = f"submission_retinanet_thresh_{thresh:.2f}.csv"
+    filtered_df.to_csv(output_csv, index=False)
+
+    print(f"✓ Created {output_csv}")
+    print(f"  Detections: {len(filtered_df)}")
+    print(f"  Avg per image: {len(filtered_df) / len(test_images):.2f}")
+
+    # Submit to Kaggle
+    message = f"RetinaNet v2 - val_loss_0.17 - thresh_{thresh:.2f}"
+
+    try:
+        result = subprocess.run(
+            ['kaggle', 'competitions', 'submit',
+             '-c', 'ecse-415-object-recognition',
+             '-f', output_csv,
+             '-m', message],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if result.returncode == 0:
+            print(f"✓ Submitted to Kaggle!")
+        else:
+            print(f"❌ Submission failed: {result.stderr}")
+            print(f"   Manual command:")
+            print(f"   !kaggle competitions submit -c ecse-415-object-recognition -f {output_csv} -m \"{message}\"")
+
+    except Exception as e:
+        print(f"⚠️  Auto-submit failed: {e}")
+        print(f"   Manual command:")
+        print(f"   !kaggle competitions submit -c ecse-415-object-recognition -f {output_csv} -m \"{message}\"")
+
+print("\n" + "=" * 70)
+print("ALL SUBMISSIONS COMPLETE!")
+print("=" * 70)
+print(f"Generated {len(THRESHOLDS_TO_TRY)} CSV files:")
+for thresh in THRESHOLDS_TO_TRY:
+    print(f"  - submission_retinanet_thresh_{thresh:.2f}.csv")
+print("\nCheck your Kaggle submissions page to see which threshold works best!")
+print("=" * 70)
