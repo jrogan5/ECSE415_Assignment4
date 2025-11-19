@@ -1,0 +1,35 @@
+# ================================
+# GPU Availability Check and Device Setup
+# ================================
+import torch
+
+# Check if CUDA GPU is available
+cuda_available = torch.cuda.is_available()
+device_name = "cuda:0" if cuda_available else "cpu"
+
+print("=" * 70)
+print("GPU AVAILABILITY CHECK")
+print("=" * 70)
+print(f"CUDA Available: {cuda_available}")
+
+if cuda_available:
+    print(f"Number of GPUs: {torch.cuda.device_count()}")
+    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    print(f"\n✓ Using device: {device_name}")
+else:
+    print(f"Number of GPUs: 0")
+    print(f"\n⚠️  No GPU detected. Training will use CPU (slower but works fine)")
+    print(f"✓ Using device: {device_name}")
+
+print("=" * 70)
+
+# Set device for YOLOv8 training
+# Use 0 for first GPU, or 'cpu' for CPU
+YOLO_DEVICE = 0 if cuda_available else 'cpu'
+
+# Set device for PyTorch models (RetinaNet)
+PYTORCH_DEVICE = torch.device(device_name)
+
+print(f"\nYOLO device setting: {YOLO_DEVICE}")
+print(f"PyTorch device setting: {PYTORCH_DEVICE}")
