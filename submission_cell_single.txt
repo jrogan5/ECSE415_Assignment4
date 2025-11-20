@@ -1,0 +1,133 @@
+# ========================================
+# Kaggle Submission Generator - Single Threshold
+# Copy this entire cell into your notebook
+# ========================================
+
+import torch
+import torch.nn as nn
+from torchvision.models.detection import retinanet_resnet50_fpn, RetinaNet_ResNet50_FPN_Weights
+from torchvision.ops import nms
+import cv2
+import numpy as np
+from pathlib import Path
+import pandas as pd
+
+# ========================================
+# CONFIGURATION - CHANGE THESE
+# ========================================
+
+MODEL_PATH = "model_retina_v2.pth"  # Your .pth file
+SCORE_THRESH = 0.15                  # Confidence threshold
+NMS_THRESH = 0.5                     # NMS threshold
+IMG_SIZE = 416                       # Training image size
+OUTPUT_CSV = "submission.csv"        # Output filename
+
+print(f"Model: {MODEL_PATH} | Threshold: {SCORE_THRESH}")
+
+# ========================================
+# Load Model
+# ========================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = retinanet_resnet50_fpn(weights=RetinaNet_ResNet50_FPN_Weights.DEFAULT)
+
+cls_head = model.head.classification_head
+in_channels = cls_head.cls_logits.in_channels
+num_anchors = cls_head.num_anchors
+new_num_classes = num_classes + 1
+
+cls_head.cls_logits = nn.Conv2d(in_channels, num_anchors * new_num_classes, kernel_size=3, stride=1, padding=1)
+cls_head.num_classes = new_num_classes
+
+state_dict = torch.load(MODEL_PATH, map_location=device)
+model.load_state_dict(state_dict)
+model.to(device)
+model.eval()
+
+print(f"✓ Model loaded on {device}")
+
+# ========================================
+# Generate Predictions
+# ========================================
+
+test_images = sorted(TEST_IMAGES.glob("*.jpg"))
+print(f"Processing {len(test_images)} images...")
+
+all_detections = []
+
+with torch.no_grad():
+    for idx, img_path in enumerate(test_images):
+        if (idx + 1) % 100 == 0:
+            print(f"  {idx + 1}/{len(test_images)}...")
+
+        image_id = img_path.stem
+
+        # Load and preprocess
+        img = cv2.imread(str(img_path))
+        if img is None:
+            all_detections.append({'ID': f"{image_id}_1", 'class_label': 0, 'x_center': 0.5, 'y_center': 0.5, 'width': 0.0, 'height': 0.0})
+            continue
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+        img_tensor = torch.from_numpy(img_resized.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
+
+        # Inference
+        outputs = model(img_tensor)
+        boxes = outputs[0]['boxes'].cpu().numpy()
+        scores = outputs[0]['scores'].cpu().numpy()
+        labels = outputs[0]['labels'].cpu().numpy()
+
+        # Filter by threshold
+        keep = scores >= SCORE_THRESH
+        boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+        # NMS per class
+        final_boxes, final_labels = [], []
+        if len(boxes) > 0:
+            for label in np.unique(labels):
+                mask = labels == label
+                keep_nms = nms(torch.from_numpy(boxes[mask]), torch.from_numpy(scores[mask]), NMS_THRESH)
+                final_boxes.append(boxes[mask][keep_nms.cpu().numpy()])
+                final_labels.append(np.full(len(keep_nms), label))
+
+            if len(final_boxes) > 0:
+                final_boxes = np.concatenate(final_boxes)
+                final_labels = np.concatenate(final_labels)
+            else:
+                final_boxes = np.array([])
+
+        # Convert to YOLO format
+        if len(final_boxes) > 0:
+            x1, y1, x2, y2 = final_boxes[:, 0]/IMG_SIZE, final_boxes[:, 1]/IMG_SIZE, final_boxes[:, 2]/IMG_SIZE, final_boxes[:, 3]/IMG_SIZE
+            x_center, y_center = (x1 + x2) / 2, (y1 + y2) / 2
+            width, height = x2 - x1, y2 - y1
+
+            for i in range(len(final_boxes)):
+                class_label = int(final_labels[i]) - 1
+                if 0 <= class_label < num_classes:
+                    det_num = len([d for d in all_detections if d['ID'].startswith(f"{image_id}_")]) + 1
+                    all_detections.append({
+                        'ID': f"{image_id}_{det_num}",
+                        'class_label': class_label,
+                        'x_center': float(np.clip(x_center[i], 0, 1)),
+                        'y_center': float(np.clip(y_center[i], 0, 1)),
+                        'width': float(np.clip(width[i], 0, 1)),
+                        'height': float(np.clip(height[i], 0, 1))
+                    })
+        else:
+            # No detections - add dummy
+            all_detections.append({'ID': f"{image_id}_1", 'class_label': 0, 'x_center': 0.5, 'y_center': 0.5, 'width': 0.0, 'height': 0.0})
+
+# ========================================
+# Save CSV
+# ========================================
+
+df = pd.DataFrame(all_detections)
+df.to_csv(OUTPUT_CSV, index=False)
+
+print(f"\n✓ Saved {len(df)} entries to {OUTPUT_CSV}")
+print(f"  Real detections: {len(df[(df['class_label'] != 0) | (df['width'] != 0.0)])}")
+print(f"  Dummy detections: {len(df[(df['class_label'] == 0) & (df['width'] == 0.0)])}")
+print(f"\nSubmit with:")
+print(f'  !kaggle competitions submit -c ecse-415-object-recognition -f {OUTPUT_CSV} -m "RetinaNet thresh {SCORE_THRESH}"')
